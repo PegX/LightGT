@@ -1,11 +1,11 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import math
-import sys
-from time import time
+
 from transformer import TransformerEncoder, TransformerEncoderLayer
+
 
 class LightGCN(nn.Module):
     def __init__(self, user_num, item_num, graph, transformer_layers, latent_dim=64, n_layers=3):
@@ -23,13 +23,12 @@ class LightGCN(nn.Module):
         nn.init.xavier_normal_(self.item_emb.weight)
 
     def cal_mean(self, embs):
-        if (len(embs) > 1):
+        if len(embs) > 1:
             embs = torch.stack(embs, dim=1)
             embs = torch.mean(embs, dim=1)
         else:
             embs = embs[0]
         users_emb, items_emb = torch.split(embs, [self.user_num, self.item_num])
-
         return users_emb, items_emb
 
     def forward(self):
@@ -37,7 +36,7 @@ class LightGCN(nn.Module):
         embs = [all_emb]
 
         embs_mean = []
-        for i in range(self.n_layers):
+        for _ in range(self.transformer_layers):
             embs_mean.append([all_emb])
 
         for layer in range(self.transformer_layers):
@@ -45,15 +44,14 @@ class LightGCN(nn.Module):
             if layer < self.n_layers:
                 embs.append(all_emb)
 
-            for i in range(layer, self.transformer_layers):
-                embs_mean[i].append(all_emb)
-            # embs_mean[layer].append(all_emb)
+            for idx in range(layer, self.transformer_layers):
+                embs_mean[idx].append(all_emb)
 
         users, items = self.cal_mean(embs)
 
         users_mean, items_mean = [], []
-        for i in range(self.transformer_layers):
-            a, b = self.cal_mean(embs_mean[i])
+        for idx in range(self.transformer_layers):
+            a, b = self.cal_mean(embs_mean[idx])
             users_mean.append(a)
             items_mean.append(b)
 
@@ -61,95 +59,148 @@ class LightGCN(nn.Module):
 
 
 class Net(nn.Module):
-    def __init__(self, user_num, item_num, graph, user_item_dict, v_feat, a_feat, t_feat, eval_dataloader, reg_weight, src_len, batch_size=2048, latent_dim=64, transformer_layers=4, nhead=1, lightgcn_layers=3, score_weight=0.05):
+    def __init__(
+        self,
+        user_num,
+        item_num,
+        graph,
+        user_item_dict,
+        v_feat,
+        a_feat,
+        t_feat,
+        eval_dataloader,
+        reg_weight,
+        src_len,
+        batch_size=2048,
+        latent_dim=64,
+        transformer_layers=4,
+        nhead=1,
+        lightgcn_layers=3,
+        score_weight=0.05,
+        device="cpu",
+    ):
         super(Net, self).__init__()
         self.user_num = user_num
         self.item_num = item_num
         self.graph = graph
         self.user_item_dict = user_item_dict
-        self.v_feat = F.normalize(v_feat) if v_feat != None else None
-        self.a_feat = F.normalize(a_feat) if a_feat != None else None
-        self.t_feat = F.normalize(t_feat) if t_feat != None else None
+        self.v_feat = F.normalize(v_feat) if v_feat is not None else None
+        self.a_feat = F.normalize(a_feat) if a_feat is not None else None
+        self.t_feat = F.normalize(t_feat) if t_feat is not None else None
         self.batch_size = batch_size
         self.latent_dim = latent_dim
         self.src_len = src_len
-        self.weight = torch.tensor([[1.], [-1.]]).cuda()
         self.reg_weight = reg_weight
         self.score_weight1 = score_weight
-        self.score_weight2 = 1-score_weight
+        self.score_weight2 = 1 - score_weight
         self.eval_dataloader = eval_dataloader
+        self.device = torch.device(device)
 
         self.transformer_layers = transformer_layers
         self.nhead = nhead
         self.lightgcn_layers = lightgcn_layers
+
+        self.register_buffer("pair_weight", torch.tensor([[1.0], [-1.0]], dtype=torch.float))
 
         self.lightgcn = LightGCN(user_num, item_num, graph, transformer_layers, latent_dim, lightgcn_layers)
 
         self.user_exp = nn.Parameter(torch.rand(user_num, latent_dim))
         nn.init.xavier_normal_(self.user_exp)
 
-        if self.v_feat != None:
+        if self.v_feat is not None:
             self.v_mlp = nn.Linear(latent_dim, latent_dim)
             self.v_linear = nn.Linear(self.v_feat.size(1), latent_dim)
             self.v_encoder_layer = TransformerEncoderLayer(d_model=latent_dim, nhead=nhead)
             self.v_encoder = TransformerEncoder(self.v_encoder_layer, num_layers=transformer_layers)
             self.v_dense = nn.Linear(latent_dim, latent_dim)
 
-        if self.a_feat != None:
+        if self.a_feat is not None:
             self.a_mlp = nn.Linear(latent_dim, latent_dim)
             self.a_linear = nn.Linear(self.a_feat.size(1), latent_dim)
             self.a_encoder_layer = TransformerEncoderLayer(d_model=latent_dim, nhead=nhead)
             self.a_encoder = TransformerEncoder(self.a_encoder_layer, num_layers=transformer_layers)
             self.a_dense = nn.Linear(latent_dim, latent_dim)
 
-        if self.t_feat != None:
+        if self.t_feat is not None:
             self.t_mlp = nn.Linear(latent_dim, latent_dim)
             self.t_linear = nn.Linear(self.t_feat.size(1), latent_dim)
             self.t_encoder_layer = TransformerEncoderLayer(d_model=latent_dim, nhead=nhead)
             self.t_encoder = TransformerEncoder(self.t_encoder_layer, num_layers=transformer_layers)
             self.t_dense = nn.Linear(latent_dim, latent_dim)
 
-    def forward(self, users, user_item, mask):
+    def _resolve_modal_features(self, v_feat=None, a_feat=None, t_feat=None):
+        return (
+            self.v_feat if v_feat is None else v_feat,
+            self.a_feat if a_feat is None else a_feat,
+            self.t_feat if t_feat is None else t_feat,
+        )
+
+    def forward(self, users, user_item, mask, v_feat=None, a_feat=None, t_feat=None):
         user_emb, item_emb, users_mean, items_mean = self.lightgcn()
+        controller = getattr(self, "_avic_controller", None)
+
+        v_feat, a_feat, t_feat = self._resolve_modal_features(v_feat=v_feat, a_feat=a_feat, t_feat=t_feat)
 
         v_src, a_src, t_src = [], [], []
-        for i in range(self.transformer_layers):
-            temp = items_mean[i][user_item].detach()
-            temp[:, 0] = users_mean[i][users].detach()
-            if self.v_feat != None:
+        for idx in range(self.transformer_layers):
+            temp = items_mean[idx][user_item].detach()
+            temp[:, 0] = users_mean[idx][users].detach()
+            if v_feat is not None:
                 v_src.append(torch.sigmoid(self.v_mlp(temp).transpose(0, 1)))
-            if self.a_feat != None:
+            if a_feat is not None:
                 a_src.append(torch.sigmoid(self.a_mlp(temp).transpose(0, 1)))
-            if self.t_feat != None:
+            if t_feat is not None:
                 t_src.append(torch.sigmoid(self.t_mlp(temp).transpose(0, 1)))
 
-        v, a, t, v_out, a_out, t_out = None, None, None, None, None, None
+        v = a = t = v_out = a_out = t_out = None
 
-        if self.v_feat != None:
-            v = self.v_linear(self.v_feat)
+        if v_feat is not None:
+            v = self.v_linear(v_feat)
             v_in = v[user_item]
             v_in[:, 0] = self.user_exp[users]
+            if controller is not None:
+                controller.put_tensor("layer0.visual.input", v_in)
             v_out = self.v_encoder(v_in.transpose(0, 1), v_src, src_key_padding_mask=mask).transpose(0, 1)[:, 0]
             v_out = F.leaky_relu(self.v_dense(v_out))
+            if controller is not None:
+                v_out = controller.patch_tensor("layer0.visual.out", v_out, select_dim=1)
+                controller.put_tensor("layer0.visual.out", v_out)
 
-        if self.a_feat != None:
-            a = self.a_linear(self.a_feat)
+        if a_feat is not None:
+            a = self.a_linear(a_feat)
             a_in = a[user_item]
             a_in[:, 0] = self.user_exp[users]
+            if controller is not None:
+                controller.put_tensor("layer0.audio.input", a_in)
             a_out = self.a_encoder(a_in.transpose(0, 1), a_src, src_key_padding_mask=mask).transpose(0, 1)[:, 0]
             a_out = F.leaky_relu(self.a_dense(a_out))
+            if controller is not None:
+                a_out = controller.patch_tensor("layer0.audio.out", a_out, select_dim=1)
+                controller.put_tensor("layer0.audio.out", a_out)
 
-        if self.t_feat != None:
-            t = self.t_linear(self.t_feat)
+        if t_feat is not None:
+            t = self.t_linear(t_feat)
             t_in = t[user_item]
             t_in[:, 0] = self.user_exp[users]
+            if controller is not None:
+                controller.put_tensor("layer0.text.input", t_in)
             t_out = self.t_encoder(t_in.transpose(0, 1), t_src, src_key_padding_mask=mask).transpose(0, 1)[:, 0]
             t_out = F.leaky_relu(self.t_dense(t_out))
+            if controller is not None:
+                t_out = controller.patch_tensor("layer0.text.out", t_out, select_dim=1)
+                controller.put_tensor("layer0.text.out", t_out)
 
         return user_emb, item_emb, v, a, t, v_out, a_out, t_out
 
-    def loss(self, users, items, user_item, mask):
-        user_emb, item_emb, v, a, t, v_out, a_out, t_out = self.forward(users[:, 0], user_item, mask.cuda())
+    def loss(self, users, items, user_item, mask, v_feat=None, a_feat=None, t_feat=None):
+        user_emb, item_emb, v, a, t, v_out, a_out, t_out = self.forward(
+            users[:, 0],
+            user_item,
+            mask.to(self.device),
+            v_feat=v_feat,
+            a_feat=a_feat,
+            t_feat=t_feat,
+        )
 
         users = users.view(-1)
         items = items - self.user_num
@@ -161,25 +212,39 @@ class Net(nn.Module):
         score1 = torch.sum(user_emb[users] * item_emb[items], dim=1).view(-1, 2)
 
         if a is not None and t is not None:
-            score2_1 = torch.sum(v_out * v[pos_items], dim=1).view(-1, 1) + torch.sum(a_out * a[pos_items], dim=1).view(-1, 1) + torch.sum(t_out * t[pos_items], dim=1).view(-1, 1)
-            score2_2 = torch.sum(v_out * v[neg_items], dim=1).view(-1, 1) + torch.sum(a_out * a[neg_items], dim=1).view(-1, 1) + torch.sum(t_out * t[neg_items], dim=1).view(-1, 1)
+            score2_1 = (
+                torch.sum(v_out * v[pos_items], dim=1).view(-1, 1)
+                + torch.sum(a_out * a[pos_items], dim=1).view(-1, 1)
+                + torch.sum(t_out * t[pos_items], dim=1).view(-1, 1)
+            )
+            score2_2 = (
+                torch.sum(v_out * v[neg_items], dim=1).view(-1, 1)
+                + torch.sum(a_out * a[neg_items], dim=1).view(-1, 1)
+                + torch.sum(t_out * t[neg_items], dim=1).view(-1, 1)
+            )
         else:
             score2_1 = torch.sum(v_out * v[pos_items], dim=1).view(-1, 1)
             score2_2 = torch.sum(v_out * v[neg_items], dim=1).view(-1, 1)
         score = self.score_weight1 * score1 + self.score_weight2 * torch.cat((score2_1, score2_2), dim=1)
 
-        loss = -torch.mean(torch.log(torch.sigmoid(torch.matmul(score, self.weight)))).cuda()
-        reg_embedding_loss = (user_emb**2).mean() + (item_emb**2).mean()
+        loss = -torch.mean(torch.log(torch.sigmoid(torch.matmul(score, self.pair_weight))))
+        reg_embedding_loss = (user_emb ** 2).mean() + (item_emb ** 2).mean()
         reg_loss = self.reg_weight * reg_embedding_loss
 
         if torch.isnan(loss):
-            print('Loss is Nan.')
-            exit()
+            raise RuntimeError("LightGT loss became NaN.")
 
         return loss + reg_loss, reg_loss, loss, reg_embedding_loss, reg_embedding_loss
 
-    def get_score_matrix(self, users, user_item, mask):
-        user_emb, item_emb, v, a, t, v_out, a_out, t_out = self.forward(users, user_item, mask.cuda())
+    def get_score_matrix(self, users, user_item, mask, v_feat=None, a_feat=None, t_feat=None):
+        user_emb, item_emb, v, a, t, v_out, a_out, t_out = self.forward(
+            users,
+            user_item,
+            mask.to(self.device),
+            v_feat=v_feat,
+            a_feat=a_feat,
+            t_feat=t_feat,
+        )
 
         score1 = torch.matmul(user_emb[users], item_emb.T)
 
@@ -189,19 +254,23 @@ class Net(nn.Module):
             score2 = torch.matmul(v_out, v.T)
 
         score_matrix = self.score_weight1 * score1 + self.score_weight2 * score2
+        controller = getattr(self, "_avic_controller", None)
+        if controller is not None:
+            score_matrix = controller.patch_tensor("layer0.score_matrix", score_matrix, select_dim=1)
+            controller.put_tensor("layer0.score_matrix", score_matrix)
 
         return score_matrix
 
     def accuracy(self, step=2000, topk=10):
         start_index = 0
-        end_index = self.user_num if step == None else step
+        end_index = self.user_num if step is None else step
 
         all_index_of_rank_list = torch.LongTensor([])
         for users, user_item, mask in self.eval_dataloader:
             score_matrix = self.get_score_matrix(users.view(-1), user_item, mask)
             _, index_of_rank_list = torch.topk(score_matrix, topk)
-            all_index_of_rank_list = torch.cat((all_index_of_rank_list, index_of_rank_list.cpu()+self.user_num), dim=0)
-            
+            all_index_of_rank_list = torch.cat((all_index_of_rank_list, index_of_rank_list.cpu() + self.user_num), dim=0)
+
             start_index = end_index
             if end_index + step < self.user_num:
                 end_index += step
@@ -212,13 +281,11 @@ class Net(nn.Module):
         precision = recall = ndcg = 0.0
 
         for row, col in self.user_item_dict.items():
-            user = row
             pos_items = set(col)
             num_pos = len(pos_items)
-            items_list = all_index_of_rank_list[user].tolist()
-    
-            items = set(items_list)
+            items_list = all_index_of_rank_list[row].tolist()
 
+            items = set(items_list)
             num_hit = len(pos_items.intersection(items))
 
             precision += float(num_hit / topk)
@@ -227,24 +294,23 @@ class Net(nn.Module):
             ndcg_score = 0.0
             max_ndcg_score = 0.0
 
-            for i in range(min(num_hit, topk)):
-                max_ndcg_score += 1 / math.log2(i+2)
-            
+            for idx in range(min(num_hit, topk)):
+                max_ndcg_score += 1 / math.log2(idx + 2)
+
             if max_ndcg_score == 0:
                 continue
-                
-            for i, temp_item in enumerate(items_list):
+
+            for idx, temp_item in enumerate(items_list):
                 if temp_item in pos_items:
-                    ndcg_score += 1 / math.log2(i+2)
-            
+                    ndcg_score += 1 / math.log2(idx + 2)
+
             ndcg += ndcg_score / max_ndcg_score
 
         return precision / length, recall / length, ndcg / length
 
     def full_accuracy(self, val_data, step=2000, topk=10):
         start_index = 0
-        end_index = self.user_num if step == None else step
-
+        end_index = self.user_num if step is None else step
 
         all_index_of_rank_list = torch.LongTensor([])
         for users, user_item, mask in self.eval_dataloader:
@@ -255,16 +321,16 @@ class Net(nn.Module):
                     row -= start_index
                     col = torch.LongTensor(list(col)) - self.user_num
                     score_matrix[row][col] = 1e-5
-                
+
             _, index_of_rank_list = torch.topk(score_matrix, topk)
-            all_index_of_rank_list = torch.cat((all_index_of_rank_list, index_of_rank_list.cpu()+self.user_num), dim=0)
-            
+            all_index_of_rank_list = torch.cat((all_index_of_rank_list, index_of_rank_list.cpu() + self.user_num), dim=0)
+
             start_index = end_index
             if end_index + step < self.user_num:
                 end_index += step
             else:
                 end_index = self.user_num
-        
+
         length = 0
         precision = recall = ndcg = 0.0
         total_hit = total_pos_item = 0
@@ -286,19 +352,19 @@ class Net(nn.Module):
 
             precision += float(num_hit / topk)
             recall += float(num_hit / num_pos)
-            
+
             ndcg_score = 0.0
             max_ndcg_score = 0.0
 
-            for i in range(min(num_pos, topk)):
-                max_ndcg_score += 1 / math.log2(i+2)
+            for idx in range(min(num_pos, topk)):
+                max_ndcg_score += 1 / math.log2(idx + 2)
             if max_ndcg_score == 0:
                 continue
 
-            for i, temp_item in enumerate(items_list):
+            for idx, temp_item in enumerate(items_list):
                 if temp_item in pos_items:
-                    ndcg_score += 1 / math.log2(i+2)
+                    ndcg_score += 1 / math.log2(idx + 2)
 
             ndcg += ndcg_score / max_ndcg_score
 
-        return precision / length, recall / length, ndcg / length, total_hit / total_pos_item
+        return precision / max(length, 1), recall / max(length, 1), ndcg / max(length, 1), total_hit / max(total_pos_item, 1)
